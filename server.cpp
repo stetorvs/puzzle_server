@@ -1,7 +1,7 @@
 #include <errno.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -11,16 +11,18 @@
 #include <assert.h>
 
 #include <algorithm>
-#include <numeric>
+#include <chrono>
+#include <cstdio>
 #include <deque>
-#include <vector>
-#include <sstream>
+#include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
-#include <cstdio>
-#include <string>
-#include <future>
 #include <mutex>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #define PORT    3490
 #define MAXMSG  512
@@ -39,10 +41,23 @@ map<string, vector<string>> group_2_members = {
   {"The Hosts", {"victor"}},
 };
 
-// Timeout
-map<string, struct timespec> timeout; /* TODO: replace with C++ chrono */
+// Group email data
+map<string, string> group_2_email = {
+  {"The Hosts", "stetorvs@gmail.com"},
+};
 
-int make_socket (uint16_t port)
+void verify_emails()
+{
+  string emails;
+  for (auto& [team, email] : group_2_email) {
+    cout << "Verifying team: " << team << '\n';
+    assert(group_2_members.count(team) != 0U);
+    emails += email;
+    emails += ' ';
+  }
+}
+
+int make_socket(uint16_t port)
 {
   int sock;
   struct sockaddr_in name;
@@ -72,14 +87,7 @@ int make_socket (uint16_t port)
   return sock;
 }
 
-time_t diff_currtime(struct timespec& base)
-{
-  struct timespec currtime;
-  clock_gettime(CLOCK_REALTIME, &currtime);
-  return difftime(currtime.tv_sec, base.tv_sec);
-}
-
-int reply_to_client (int filedes, string msg)
+int reply_to_client(int filedes, string msg)
 {
   int msg_size = msg.length() + 1;
   int nbytes = write(filedes, msg.c_str(), msg_size);
@@ -166,6 +174,16 @@ string get_response(const string& question, const string& ans, bool &correct)
   return response;
 }
 
+string sanitize(string st)
+{
+  size_t pos = st.find('\'');
+  while (pos != string::npos) {
+    st.replace(pos, 1, "'\\''");
+    pos = st.find('\'', pos+4);
+  }
+  return st;
+}
+
 void email(string msg, string subject, string to)
 {
   if (msg.back() == '\n') {
@@ -174,30 +192,78 @@ void email(string msg, string subject, string to)
   if (subject.back() == '\n') {
     subject.pop_back();
   }
-  string cmd = "echo '" + msg + "' | mail -s 'Puzzle: " + subject + "' " + to;
+  string cmd = "echo '" + sanitize(msg) + "' | mail -s 'Puzzle: " + sanitize(subject) + "' '" + sanitize(to) + "'";
   system(cmd.c_str());
 }
 
 void update_scoreboard(string group, string question)
 {
   lock_guard<mutex> write_lock(write_mutex);
-  // TODO: update scoreboard text file
+
+  vector<string> questions = {"cheating", "crash", "debug_msg", "difference"};
+
+  // Laziness from static...
+  static map<string, map<string, int>> score_standings;
+  if (score_standings.empty()) {
+    map<string, int> empty;
+    transform(questions.begin(), questions.end(), inserter(empty, empty.end()), [] (string& name) { return pair(name, 0); });
+    for (auto& p : group_2_members) {
+      score_standings[p.first] = empty;
+    }
+  }
+
+  static map<string, string> last_solve;
+  if (last_solve.empty()) {
+    for (auto& p : group_2_members) {
+      time_t ls_time = chrono::system_clock::to_time_t(chrono::system_clock::now());
+      string t(ctime(&ls_time));
+      last_solve[p.first] = t.substr(0, t.length()-1); // Strip newline
+    }
+  }
+
+  // Now actually update
+  if (score_standings[group][question] != 0) {
+    return;
+  }
+
+  ofstream ofs("standings.txt");
+
+  if (question == "meta") {
+    score_standings[group][question] = 3;
+  } else {
+    score_standings[group][question] = 1;
+  }
+  time_t ls_time = chrono::system_clock::to_time_t(chrono::system_clock::now());
+  string t(ctime(&ls_time));
+  last_solve[group] = t.substr(0, t.length()-1); // Strip newline
+
+  // File update
+  for (auto& p : group_2_members) {
+    const string& team = p.first;
+    ofs << "| " << team << " | ";
+    ofs << accumulate(score_standings[team].begin(), score_standings[team].end(), 0, [] (int sum, const pair<string, int>& p) { return sum + p.second; });
+    ofs << " | " << last_solve[team] << " |";
+    for (auto& score_pair : score_standings[team]) {
+      ofs << ' ' << score_pair.second << " |";
+    }
+    ofs << '\n';
+  }
 }
 
-int read_from_client (int filedes)
+int read_from_client (int filedes, const string& ip)
 {
   char buffer[MAXMSG];
   int nbytes;
 
   // static because I'm lazy
   static auto member_2_group_map = get_member_2_group(group_2_members);
+  static map<pair<string, string>, chrono::time_point<chrono::system_clock>> ip_group_2_time;
 
   nbytes = read (filedes, buffer, MAXMSG);
   if (nbytes < 0)
     {
       /* Read error. */
-      perror ("read");
-      exit (EXIT_FAILURE);
+      return -2;
     }
   else if (nbytes == 0)
     /* End-of-file. */
@@ -214,27 +280,49 @@ int read_from_client (int filedes)
       ss >> ans;
       ss >> user;
 
+      for (char& c : question) c = tolower(c);
+      for (char& c : ans) c = tolower(c);
+
       auto find_it = member_2_group_map.find(user);
       string response = string("Sorry, user ") + user + string(" does not belong to any team\n");
-      time_t delta = (1 == timeout.count(user)) ? diff_currtime(timeout[user]) : (TIMEOUT_THRESHOLD + 1);
-      if (delta < TIMEOUT_THRESHOLD) {
-        response = string("Please wait ") + to_string(TIMEOUT_THRESHOLD - delta) + " second(s) before trying again\n";
-      } else if (find_it != end(member_2_group_map)) {
-        bool correct = false;
-        response = get_response(question, ans, correct);
-        if (!correct) {
-          struct timespec currtime;
-          clock_gettime(CLOCK_REALTIME, &currtime);
-          timeout[user] = currtime;
+      if (find_it != end(member_2_group_map)) {
+        // Check timestamp
+        chrono::time_point<chrono::system_clock> curr_t = chrono::system_clock::now();
+        auto& last_t = ip_group_2_time[pair(ip, find_it->second)];
+        chrono::duration<double> dur_t = curr_t - last_t;
+        constexpr double timeout = 15.;
+        if (dur_t.count() < timeout) {
+          response = string("Please wait ") + to_string(timeout - dur_t.count()) + " seconds before submitting\n";
+          return reply_to_client(filedes, response);
         }
-        string recipients = DEFAULT_EMAIL + " " + user + "@altera.com";
+        last_t = curr_t;
+        bool correct = false;
+        auto group = find_it->second;
+        response = get_response(question, ans, correct);
+        response += "Team name: " + group + '\n';
+        string recipients = DEFAULT_EMAIL + " " + group_2_email[group];
         if (correct) {
-          auto group = find_it->second;
-          auto group_members = group_2_members[group];
-          recipients = accumulate(begin(group_members), end(group_members), recipients, [] (string ans, string in) { return ans + " " + in + "@altera.com";});
-
           futures.emplace_back(async(launch::async, [=] () { update_scoreboard(group, question); }));
         }
+        futures.emplace_back(async(launch::async, [=] () { email(question+" "+ans+" "+user, response, recipients); }));
+      } else if (user == "guest") {
+        // Check timestamp
+        string guest_email;
+        ss >> guest_email;
+        chrono::time_point<chrono::system_clock> curr_t = chrono::system_clock::now();
+        auto& last_t = ip_group_2_time[pair(ip, guest_email)];
+        chrono::duration<double> dur_t = curr_t - last_t;
+        constexpr double timeout = 15.;
+        if (dur_t.count() < timeout) {
+          response = string("Please wait ") + to_string(timeout - dur_t.count()) + " seconds before submitting\n";
+          return reply_to_client(filedes, response);
+        }
+        last_t = curr_t;
+        bool correct = false;
+        auto group = find_it->second;
+        response = get_response(question, ans, correct);
+        response += "Guest team\n";
+        string recipients = DEFAULT_EMAIL + " " + guest_email;
         futures.emplace_back(async(launch::async, [=] () { email(question+" "+ans+" "+user, response, recipients); }));
       }
 
@@ -249,6 +337,12 @@ int main (void)
   int i;
   struct sockaddr_in clientname;
   socklen_t size;
+  map<int, string> fd_to_ip;
+
+  verify_emails();
+
+  /* Ignore SIGPIPE errors. */
+  signal(SIGPIPE, SIG_IGN);
 
   /* Create the socket and set it up to accept connections. */
   sock = make_socket (PORT);
@@ -304,11 +398,12 @@ int main (void)
                          ntohs (clientname.sin_port),
                          new_fd);
                 FD_SET (new_fd, &active_fd_set);
+                fd_to_ip[new_fd] = inet_ntoa (clientname.sin_addr);
               }
             else
               {
                 /* Data arriving on an already-connected socket. */
-                if (read_from_client (i) < 0)
+                if (read_from_client (i, fd_to_ip[i]) < 0)
                   {
                     close (i);
                     FD_CLR (i, &active_fd_set);

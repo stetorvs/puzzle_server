@@ -7,6 +7,7 @@ all: $(EXES)
 
 %.out: %.cpp
 	$(CXX) -o $@ $< $(CXXFLAGS)
+	chmod 700 $@
 
 clean:
 	rm -f $(EXES)
